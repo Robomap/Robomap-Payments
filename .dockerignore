@@ -1,0 +1,6 @@
+.git
+.azure
+.cursor
+**/__pycache__
+**/*.pyc
+README.md
