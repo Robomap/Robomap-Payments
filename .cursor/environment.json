@@ -1,0 +1,4 @@
+{
+  "name": "Robomap-Payments",
+  "install": "bash .cursor/install.sh"
+}
