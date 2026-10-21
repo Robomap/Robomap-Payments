@@ -1,12 +1,12 @@
 # Robomap Payments
 
-Payments host for [robomap.ai](https://robomap.ai/), published at `https://payments.robomap.ai`.
+Robomap Payments is published at [https://payments.robomap.ai](https://payments.robomap.ai).
 
-The service is a Python HTTP app. `GET /` is the public page and `GET /health` returns JSON. It does not collect card numbers.
-
-The live host is the existing Container App `robomap-payments` in resource group `Robomap-APP`, environment `robomap`, France Central, using registry `robomap.azurecr.io`. `scripts/publish.sh` builds the image there, updates the app, and points the `payments` CNAME on the `robomap.ai` Azure DNS zone at it. `infra/` is a standalone Bicep layout and is not what the publish script applies.
+The live site is the Azure Static Web App `robomap-payments` in resource group `rg-robomap-payments` (West Europe). `scripts/publish.sh` points the `payments` CNAME on the `robomap.ai` Azure DNS zone at that app and binds the hostname.
 
 ```bash
 az login
 bash scripts/publish.sh
 ```
+
+The Python process in `src/` is a separate health page and is not the published product.
