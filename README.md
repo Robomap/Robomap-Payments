@@ -39,10 +39,14 @@ cd src && python -m unittest test_sso test_server -v
 
 ## Deploy
 
+Production must run the **Container App** BFF (not the Static Web App). See [`docs/DEPLOY.md`](docs/DEPLOY.md).
+
 ```bash
 az login
-bash scripts/publish.sh   # CNAME + SWA hostname (existing path)
-# or: azd up                # Container App via azure.yaml + Dockerfile
+export PAYMENTS_SESSION_SECRET='…'   # required; never commit
+bash scripts/publish.sh              # ACR build → ACA update → DNS to ACA
 ```
 
-Required production secrets: `PAYMENTS_SESSION_SECRET`. Optional: `ROBOMAP_API_ORIGIN`, `ROBOMAP_SSO_APP`.
+CI: `.github/workflows/deploy-container-app.yml` (OIDC → same `scripts/publish.sh` on `main`).
+
+Required production secrets: `PAYMENTS_SESSION_SECRET` (plus `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_SUBSCRIPTION_ID` for Actions). Optional: `ROBOMAP_API_ORIGIN`, `ROBOMAP_SSO_APP`.
