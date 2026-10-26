@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 .venv/
+web/node_modules/
+web/dist/
+*.egg-info/
+.DS_Store
