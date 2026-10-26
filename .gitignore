@@ -4,5 +4,6 @@ __pycache__/
 .venv/
 web/node_modules/
 web/dist/
+web/tsconfig.tsbuildinfo
 *.egg-info/
 .DS_Store
