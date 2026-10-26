@@ -65,6 +65,18 @@ After that lands in production, logged-in `app.robomap.ai` users hitting payment
 
 Never put API client secrets or the session HMAC in the browser bundle. The SPA only ever sees a one-time `access_token` in the URL, which is exchanged once and stripped from history.
 
+## Why handoff (not browser cookie SSO)
+
+Live production already sets `robomap_session` / `XSRF-TOKEN` on `Domain=.robomap.ai; Secure; SameSite=None`, and `POST /auth/login` CORS already allows `https://payments.robomap.ai`. That looks like “just call `/auth/me` with credentials from the SPA,” but:
+
+- `GET /auth/me` (and its OPTIONS preflight) often omit `Access-Control-Allow-*`, so a credentialed browser `fetch` from payments is blocked even when the cookie is present.
+- The Angular app’s `access_token` lives in **sessionStorage** (per-origin) — it is not shared with payments.
+- App login `returnUrl` only accepts same-app relative paths; absolute `https://payments.robomap.ai/...` is rejected unless the monorepo handoff/OAuth allowlist is used.
+
+The AEO-style handoff avoids those gaps: the API reads the shared cookie on a top-level navigation, returns a one-time `access_token` to payments `/login`, and payments validates it **server-side** (no cross-origin credentialed XHR required for session establishment).
+
+Also confirm in `backend/config/sanctum.php` that `payments.robomap.ai` is on `SANCTUM_STATEFUL_DOMAINS` (or equivalent). Cookie `SESSION_DOMAIN=.robomap.ai` is already correct in production.
+
 ## Security notes
 
 - Return URLs are sanitized to same-origin relative paths (no `//`, no scheme, no `/auth/*`).
