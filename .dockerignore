@@ -3,4 +3,8 @@
 .cursor
 **/__pycache__
 **/*.pyc
-README.md
+.venv
+web/node_modules
+web/dist
+*.md
+!README.md

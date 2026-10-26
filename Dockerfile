@@ -1,11 +1,19 @@
+# Build the payments SPA, then serve it from the Python BFF (SSO + static).
+FROM node:22-alpine AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json* ./
+RUN npm install
+COPY web/ ./
+RUN npm run build
+
 FROM python:3.13-slim
-
 WORKDIR /app
-COPY src/server.py /app/server.py
+COPY src/ /app/
+COPY --from=web /web/dist /app/web/dist
 
-# Port 80 matches the Container Apps hello-world placeholder, so the ingress
-# probe stays valid when this image replaces it. Binding port 80 requires root.
 ENV PORT=80
+ENV STATIC_ROOT=/app/web/dist
+ENV PYTHONUNBUFFERED=1
 EXPOSE 80
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \

@@ -1,18 +1,25 @@
-"""Robomap Payments HTTP host.
+"""Robomap Payments HTTP host with Robomap SSO.
 
-The process binds to 0.0.0.0 and PORT (default 8080) so it can run in Azure
-Container Apps. It does not collect card data.
+Binds to 0.0.0.0 and PORT (default 8080). Serves the payments SPA from
+web/dist when present, and exchanges Robomap SSO access_tokens for a
+payments session cookie after server-side validation.
 """
 
 from __future__ import annotations
 
-import html
 import json
+import mimetypes
 import os
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import session_cookie
+import sso
 
 SERVICE = "robomap-payments"
 DEFAULT_SITE_HOST = "payments.robomap.ai"
+STATIC_ROOT = Path(os.environ.get("STATIC_ROOT", Path(__file__).resolve().parent.parent / "web" / "dist"))
 
 
 def site_host() -> str:
@@ -27,148 +34,211 @@ def health_payload() -> dict[str, str]:
     return {"status": "ok", "service": SERVICE, "host": site_host()}
 
 
-def render_page() -> bytes:
-    host = html.escape(site_host(), quote=True)
-    page = f"""<!DOCTYPE html>
+def _json_bytes(payload: object) -> bytes:
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def _read_json_body(handler: BaseHTTPRequestHandler, limit: int = 32_768) -> dict | None:
+    length = int(handler.headers.get("Content-Length") or "0")
+    if length <= 0 or length > limit:
+        return None
+    raw = handler.rfile.read(length)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def current_user(handler: BaseHTTPRequestHandler) -> dict | None:
+    token = session_cookie.parse_cookie_header(handler.headers.get("Cookie"))
+    return session_cookie.verify_session(token)
+
+
+def resolve_static(path: str) -> Path | None:
+    if not STATIC_ROOT.is_dir():
+        return None
+    relative = path.lstrip("/") or "index.html"
+    candidate = (STATIC_ROOT / relative).resolve()
+    try:
+        candidate.relative_to(STATIC_ROOT.resolve())
+    except ValueError:
+        return None
+    if candidate.is_file():
+        return candidate
+    # SPA fallback for client routes.
+    index = STATIC_ROOT / "index.html"
+    return index if index.is_file() else None
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "RobomapPayments/1.1"
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._dispatch(include_body=True)
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        self._dispatch(include_body=False)
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path == "/api/auth/session":
+            self._post_session()
+            return
+        if path == "/api/auth/logout":
+            self._post_logout()
+            return
+        self._send(405, "text/plain; charset=utf-8", b"Method not allowed\n", include_body=True)
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        # Same-origin SPA; keep OPTIONS simple for local tooling.
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _dispatch(self, include_body: bool) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        query = urllib.parse.parse_qs(parsed.query)
+
+        if path in ("/health", "/healthz", "/ready"):
+            self._send(200, "application/json", _json_bytes(health_payload()), include_body)
+            return
+
+        if path == "/api/auth/me":
+            user = current_user(self)
+            if not user:
+                self._send(401, "application/json", _json_bytes({"authenticated": False}), include_body)
+                return
+            self._send(200, "application/json", _json_bytes({"authenticated": True, "user": user}), include_body)
+            return
+
+        if path == "/auth/sso/start":
+            return_url = (query.get("returnUrl") or query.get("return_url") or [None])[0]
+            location = sso.build_handoff_url(return_url)
+            self._redirect(location, include_body)
+            return
+
+        if path.startswith("/auth/oauth/"):
+            provider = path.rsplit("/", 1)[-1]
+            if provider not in ("google", "apple"):
+                self._send(404, "text/plain; charset=utf-8", b"Not found\n", include_body)
+                return
+            return_url = (query.get("returnUrl") or [None])[0]
+            self._redirect(sso.build_oauth_url(provider, return_url), include_body)
+            return
+
+        # Static SPA (and SPA deep links).
+        static_file = resolve_static(path)
+        if static_file is not None:
+            data = static_file.read_bytes()
+            content_type = mimetypes.guess_type(str(static_file))[0] or "application/octet-stream"
+            if static_file.name == "index.html":
+                content_type = "text/html; charset=utf-8"
+            self._send(200, content_type, data, include_body)
+            return
+
+        # Fallback HTML when the SPA has not been built yet (container health / early boot).
+        if path == "/":
+            self._send(200, "text/html; charset=utf-8", self._fallback_home(), include_body)
+            return
+
+        self._send(404, "text/plain; charset=utf-8", b"Not found\n", include_body)
+
+    def _post_session(self) -> None:
+        body = _read_json_body(self)
+        if not body:
+            self._send(400, "application/json", _json_bytes({"error": "invalid_json"}), True)
+            return
+        access_token = body.get("access_token") or body.get("accessToken")
+        if not isinstance(access_token, str) or not access_token.strip():
+            self._send(400, "application/json", _json_bytes({"error": "missing_access_token"}), True)
+            return
+        return_url = sso.sanitize_return_url(body.get("returnUrl") or body.get("return_url"))
+        user = sso.fetch_user_for_access_token(access_token)
+        if not user:
+            self._send(401, "application/json", _json_bytes({"error": "invalid_token"}), True)
+            return
+        token = session_cookie.issue_session(user)
+        secure = os.environ.get("COOKIE_SECURE", "1") != "0"
+        self._send(
+            200,
+            "application/json",
+            _json_bytes({"ok": True, "user": user, "returnUrl": return_url}),
+            True,
+            extra_headers=[("Set-Cookie", session_cookie.set_cookie_header(token, secure=secure))],
+        )
+
+    def _post_logout(self) -> None:
+        secure = os.environ.get("COOKIE_SECURE", "1") != "0"
+        self._send(
+            200,
+            "application/json",
+            _json_bytes({"ok": True}),
+            True,
+            extra_headers=[("Set-Cookie", session_cookie.clear_cookie_header(secure=secure))],
+        )
+
+    def _fallback_home(self) -> bytes:
+        host = site_host()
+        page = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Payments | Robomap</title>
-  <meta name="description" content="Robomap payments host for robomap.ai.">
-  <meta name="robots" content="index, follow">
   <link rel="canonical" href="https://{host}/">
-  <style>
-    :root {{
-      color-scheme: light;
-      --page: #ffffff;
-      --ink: #000000;
-      --muted: #6b6b6b;
-      --line: rgba(0, 0, 0, 0.14);
-      --surface: #f6f6f6;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      min-height: 100vh;
-      font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      font-size: 17px;
-      line-height: 1.47;
-      letter-spacing: -0.022em;
-      color: var(--ink);
-      background: var(--page);
-    }}
-    header, main {{
-      width: min(calc(100% - 48px), 720px);
-      margin: 0 auto;
-    }}
-    header {{
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      min-height: 72px;
-    }}
-    a {{ color: inherit; }}
-    .wordmark {{ font-weight: 650; letter-spacing: -0.04em; text-decoration: none; }}
-    main {{ padding: 48px 0 72px; }}
-    h1 {{
-      margin: 0 0 12px;
-      font-size: clamp(40px, 6vw, 64px);
-      line-height: 1.05;
-      letter-spacing: -0.045em;
-      font-weight: 650;
-    }}
-    p {{ margin: 0 0 16px; max-width: 38rem; }}
-    .muted {{ color: var(--muted); }}
-    .status {{
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      margin: 8px 0 28px;
-      padding: 8px 12px;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      background: var(--surface);
-      font-size: 14px;
-    }}
-    .dot {{
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: #0a7a32;
-    }}
-    .actions {{ display: flex; gap: 12px; flex-wrap: wrap; margin-top: 28px; }}
-    .button {{
-      display: inline-flex;
-      align-items: center;
-      min-height: 44px;
-      padding: 0 18px;
-      border-radius: 999px;
-      background: #000;
-      color: #fff;
-      text-decoration: none;
-    }}
-    .button.secondary {{
-      background: #fff;
-      color: #000;
-      border: 1px solid var(--line);
-    }}
-  </style>
 </head>
 <body>
-  <header>
-    <a class="wordmark" href="https://robomap.ai/">Robomap</a>
-    <a href="https://robomap.ai/">robomap.ai</a>
-  </header>
   <main>
-    <p class="muted">Payments</p>
-    <h1>Robomap payments is up.</h1>
-    <div class="status"><span class="dot" aria-hidden="true"></span> Service healthy at {host}</div>
-    <p>This host is the payments endpoint for Robomap, the on-demand industrial and technical services marketplace.</p>
-    <p class="muted">Book a technician on the main site. This page does not collect card numbers.</p>
-    <div class="actions">
-      <a class="button" href="https://robomap.ai/">Go to Robomap</a>
-      <a class="button secondary" href="/health">Health</a>
-    </div>
+    <h1>Robomap Payments</h1>
+    <p>Build the web app (<code>web/dist</code>) or open the Static Web App deploy.</p>
+    <p><a href="/auth/sso/start?returnUrl=/app">Continue with Robomap SSO</a></p>
+    <p><a href="/health">Health</a></p>
   </main>
 </body>
 </html>
 """
-    return page.encode("utf-8")
+        return page.encode("utf-8")
 
+    def _redirect(self, location: str, include_body: bool) -> None:
+        body = b""
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        if include_body:
+            self.wfile.write(body)
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = "RobomapPayments/1.0"
-    protocol_version = "HTTP/1.1"
-
-    def do_GET(self) -> None:  # noqa: N802
-        self._respond(include_body=True)
-
-    def do_HEAD(self) -> None:  # noqa: N802
-        self._respond(include_body=False)
-
-    def do_POST(self) -> None:  # noqa: N802
-        self._send(405, "text/plain; charset=utf-8", b"Method not allowed\n", include_body=True)
-
-    def _respond(self, include_body: bool) -> None:
-        path = self.path.split("?", 1)[0]
-        if path in ("/health", "/healthz", "/ready"):
-            body = json.dumps(health_payload()).encode("utf-8")
-            self._send(200, "application/json", body, include_body)
-            return
-        if path == "/":
-            self._send(200, "text/html; charset=utf-8", render_page(), include_body)
-            return
-        self._send(404, "text/plain; charset=utf-8", b"Not found\n", include_body)
-
-    def _send(self, status: int, content_type: str, body: bytes, include_body: bool) -> None:
+    def _send(
+        self,
+        status: int,
+        content_type: str,
+        body: bytes,
+        include_body: bool,
+        extra_headers: list[tuple[str, str]] | None = None,
+    ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body) if include_body else 0))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
-        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'")
+        if content_type.startswith("text/html"):
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+                "font-src 'self' https://cdn.jsdelivr.net; img-src 'self' data:; "
+                "connect-src 'self'; frame-ancestors 'none'",
+            )
+        for key, value in extra_headers or []:
+            self.send_header(key, value)
         self.end_headers()
         if include_body:
             self.wfile.write(body)
@@ -184,6 +254,7 @@ def make_server(port: int | None = None) -> ThreadingHTTPServer:
 def main() -> None:
     server = make_server()
     print(f"listening on 0.0.0.0:{server.server_address[1]}")
+    print(f"static root: {STATIC_ROOT} exists={STATIC_ROOT.is_dir()}")
     server.serve_forever()
 
 
