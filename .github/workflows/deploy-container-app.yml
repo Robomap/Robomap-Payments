@@ -4,6 +4,8 @@
 name: Deploy Container App
 
 on:
+  pull_request:
+    branches: [main]
   push:
     branches: [main]
   workflow_dispatch:
@@ -13,7 +15,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: deploy-payments-container-app
+  group: deploy-payments-container-app-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -45,6 +47,7 @@ jobs:
           npm run build
 
   deploy:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: test
     runs-on: ubuntu-latest
     environment: production
