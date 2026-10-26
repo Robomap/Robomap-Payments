@@ -1,0 +1,73 @@
+# Deploy Robomap Payments (Python BFF + SPA) to the existing Azure Container App.
+# Modeled on the Robomap Container Apps path used by sibling hosts (aeo/frontend):
+# resource group Robomap-APP, environment robomap, registry robomap.azurecr.io, OIDC via azure/login.
+name: Deploy Container App
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-payments-container-app
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Unit tests
+        working-directory: src
+        run: python -m unittest test_sso test_server -v
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build SPA
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'Robomap-APP' }}
+      CONTAINER_APP_ENVIRONMENT: ${{ vars.CONTAINER_APP_ENVIRONMENT || 'robomap' }}
+      CONTAINER_APP_NAME: ${{ vars.CONTAINER_APP_NAME || 'robomap-payments' }}
+      CONTAINER_REGISTRY: ${{ vars.CONTAINER_REGISTRY || 'robomap' }}
+      STATIC_WEB_APP_RESOURCE_GROUP: ${{ vars.STATIC_WEB_APP_RESOURCE_GROUP || 'rg-robomap-payments' }}
+      STATIC_WEB_APP_NAME: ${{ vars.STATIC_WEB_APP_NAME || 'robomap-payments' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy image, session secret, and payments.robomap.ai DNS
+        env:
+          PAYMENTS_SESSION_SECRET: ${{ secrets.PAYMENTS_SESSION_SECRET }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: bash scripts/publish.sh
